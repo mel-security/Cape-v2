@@ -44,7 +44,7 @@ class CapeDoctor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.hostname = socket.gethostname()
-        self.timestamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        self.timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
         default_out = Path.cwd() / f"cape_triage_{self.timestamp}"
         self.out_dir = Path(args.out_dir or default_out).resolve()
         self.logs_dir = self.out_dir / "logs"
@@ -54,6 +54,7 @@ class CapeDoctor:
         self.findings: List[Finding] = []
         self.inventory: Dict[str, str] = {}
         self.detected: Dict[str, str] = {}
+        self.runtime_secrets: List[str] = [args.guest_password] if args.guest_password else []
         self.logger = logging.getLogger("cape_doctor")
 
         for d in [self.out_dir, self.logs_dir, self.cmd_dir, self.cfg_dir, self.meta_dir]:
@@ -113,8 +114,8 @@ class CapeDoctor:
         return CapeDoctor._mask_public_ip(output)
 
     def run_cmd(self, command: str, name: str, timeout: int = 30) -> CmdResult:
-        started = dt.datetime.utcnow().isoformat() + "Z"
-        self.logger.debug("Running command [%s]: %s", name, command)
+        started = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        self.logger.debug("Running command [%s]: %s", name, self._mask_runtime_secrets(command))
         try:
             proc = subprocess.run(
                 command,
@@ -130,18 +131,25 @@ class CapeDoctor:
             rc = 124
             out = exc.stdout or ""
             err = (exc.stderr or "") + "\nTIMEOUT"
-        ended = dt.datetime.utcnow().isoformat() + "Z"
+        ended = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
         result = CmdResult(command, rc, out, err, started, ended)
         content = {
-            "command": command,
+            "command": self._mask_runtime_secrets(command),
             "rc": rc,
             "started_at": started,
             "ended_at": ended,
-            "stdout": self._mask_secrets(out),
-            "stderr": self._mask_secrets(err),
+            "stdout": self._mask_runtime_secrets(out),
+            "stderr": self._mask_runtime_secrets(err),
         }
         (self.cmd_dir / f"{name}.json").write_text(json.dumps(content, indent=2), encoding="utf-8")
         return result
+
+    def _mask_runtime_secrets(self, text: str) -> str:
+        masked = self._mask_secrets(text)
+        for secret in self.runtime_secrets:
+            if secret and secret in masked:
+                masked = masked.replace(secret, "***")
+        return masked
 
     def detect_environment(self) -> None:
         os_release = self.run_cmd("cat /etc/os-release", "os_release")
@@ -533,7 +541,7 @@ class CapeDoctor:
         report = self.out_dir / "report.md"
         lines: List[str] = []
         lines.append(f"# CAPE/Cuckoo Triage Report\n")
-        lines.append(f"- Generated: {dt.datetime.utcnow().isoformat()}Z")
+        lines.append(f"- Generated: {dt.datetime.now(dt.timezone.utc).isoformat().replace('+00:00', 'Z')}")
         lines.append(f"- Host: {self.hostname}")
         lines.append(f"- Framework: {self.detected.get('framework', 'unknown')}")
         lines.append(f"- Hypervisor: {self.detected.get('hypervisor', 'unknown')}")
