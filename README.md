@@ -622,6 +622,180 @@ Examiner `failed_analyses/` dans l'archive pour les logs de crash détaillés.
 
 ---
 
+## FAQ / Troubleshooting étendu
+
+### Q1 : Chrome/Edge crash immédiatement mais IE fonctionne, pourquoi ?
+
+IE n'utilise pas d'architecture multi-process ni de GPU process séparé. Chrome/Edge lancent un process GPU dédié qui tente d'initialiser l'accélération graphique matérielle. Dans une VM sans GPU réel (ou avec un adaptateur vidéo inadapté), ce process crash au démarrage.
+
+**Diagnostic :**
+```bash
+sudo python3 cape_doctor.py --vm-name <vm> --verbose
+```
+Chercher dans le rapport : `KVM video adapter`, `3D acceleration`, `VM RAM too low`.
+
+**Fix rapide :** lancer le navigateur avec `--disable-gpu --no-sandbox` ou appliquer `--fix`.
+
+### Q2 : J'ai désactivé la 3D et changé l'adaptateur vidéo mais ça crash toujours
+
+Causes restantes par ordre de probabilité :
+
+1. **Snapshot non recréé** : après modification de la VM, l'ancien snapshot restaure la config précédente. Recréer impérativement le snapshot (voir Guide de résolution, étape 3).
+2. **RAM VM < 4 GB** : Chrome/Edge consomment 2-3 GB seuls. Vérifier `ram_mib` dans le rapport.
+3. **CAPE monitor (capemon) injection** : l'injection DLL dans les processus navigateur crash le browser sandbox. Tester avec `options=free=yes`. Si ça marche, le problème vient de l'injection.
+4. **VC++ Redistributables manquants** : installer VC++ 2015-2022 x86+x64 dans le guest.
+5. **Profil navigateur corrompu** : supprimer le profil Chrome/Edge par défaut dans le guest avant de prendre le snapshot.
+
+### Q3 : IE affiche TOUTES les URLs comme malveillantes, même google.com
+
+Ce n'est pas un vrai positif. L'analyse CAPE classe le comportement réseau comme malveillant à cause d'artefacts d'infrastructure :
+
+1. **Proxy MITM / sniffer actif** : CAPE intercept le trafic TLS. IE détecte le certificat invalide, affiche une page d'erreur. Les signatures CAPE/Suricata classent cette erreur comme indicateur de malveillance.
+   - Vérifier `auxiliary.conf` : section `[mitm]` et `[sniffer]`.
+   - Le rapport affiche `mitm_enabled: yes` si détecté.
+
+2. **DNS sinkhole** : un DNS qui redirige tout vers une IP interne produit des block pages identiques pour chaque URL, interprétées comme malveillantes.
+   - Vérifier `/etc/resolv.conf` sur l'hôte et la config DNS dans le guest.
+
+3. **Certificats racine manquants dans le guest** : le navigateur refuse les connexions TLS, générant des erreurs réseau classées comme suspectes.
+   - Installer les certificats racine dans le magasin Windows du guest.
+
+4. **Scoring CAPE/Suricata trop agressif** : certaines règles Suricata ou signatures YARA marquent des patterns légitimes.
+   - Vérifier `processing.conf` et `reporting.conf` pour les seuils de scoring.
+   - Examiner les règles Suricata actives.
+
+**Diagnostic :**
+```bash
+sudo python3 cape_doctor.py --vm-name <vm> --online
+```
+Le flag `--online` teste la connectivité DNS/HTTPS depuis l'hôte pour confirmer si le problème est réseau.
+
+### Q4 : Le script affiche "Hypervisor not auto-detected"
+
+Le script cherche `virsh` (KVM) ou `VBoxManage` (VirtualBox) dans le PATH. Si ces binaires ne sont pas installés ou pas dans le PATH du user root :
+
+```bash
+# Vérifier
+which virsh
+which VBoxManage
+
+# Forcer le type
+sudo python3 cape_doctor.py --hypervisor kvm --vm-name <vm>
+sudo python3 cape_doctor.py --hypervisor virtualbox --vm-name <vm>
+```
+
+### Q5 : Le `--fix` a modifié ma VM mais l'ancienne snapshot ne marche plus
+
+C'est attendu. Le `--fix` modifie la définition de la VM (XML KVM ou config VBox). L'ancien snapshot référence l'ancienne configuration. Il faut :
+
+1. Démarrer la VM manuellement
+2. Attendre le boot complet (desktop visible)
+3. Si l'adaptateur vidéo a été changé vers QXL (KVM), installer le driver QXL WDDM depuis l'ISO virtio-win
+4. Prendre un nouveau snapshot
+
+```bash
+# KVM
+virsh start <vm>
+# ... attendre boot ...
+virsh snapshot-create-as <vm> clean --atomic
+
+# VirtualBox
+VBoxManage startvm <vm> --type headless
+# ... attendre boot ...
+VBoxManage snapshot <vm> take clean --live
+```
+
+### Q6 : Quelle est la configuration VM optimale pour les navigateurs modernes ?
+
+**KVM :**
+```xml
+<memory unit='GiB'>4</memory>
+<cpu mode='host-passthrough'/>
+<features>
+  <hyperv>
+    <relaxed state='on'/>
+    <vapic state='on'/>
+    <spinlocks state='on' retries='8191'/>
+  </hyperv>
+</features>
+<video>
+  <model type='qxl' vram='131072' heads='1'/>
+</video>
+```
+- Pas de `accel3d='yes'`
+- Driver QXL WDDM installé dans le guest
+
+**VirtualBox :**
+```
+VBoxManage modifyvm <vm> --memory 4096 --vram 128 \
+  --graphicscontroller vboxvga --accelerate3d off \
+  --hwvirtex on --nestedpaging on
+```
+
+**Guest Windows :**
+- VC++ Redistributables 2015-2022 (x86 + x64)
+- .NET Framework 4.8
+- Chrome/Edge lancé avec `--disable-gpu --no-sandbox --disable-dev-shm-usage`
+- SmartScreen désactivé (GPO ou registre)
+- Windows Defender en mode passif ou désactivé
+- Windows Update arrêté (pour stabilité du snapshot)
+- NTP synchronisé
+
+### Q7 : Comment savoir si c'est l'injection CAPE qui fait crasher le navigateur ?
+
+Soumettre une analyse avec `options=free=yes`. Ce mode désactive l'injection du monitor CAPE dans les processus. Si le navigateur ne crashe plus :
+
+- Le problème est confirmé comme étant l'injection DLL.
+- Solution temporaire : `options=injection=0`
+- Solution pérenne : mettre à jour CAPE (les versions récentes gèrent mieux les navigateurs multi-process).
+
+### Q8 : Le script peut-il collecter les logs du guest Windows ?
+
+**Sans credentials (par défaut)** : le script collecte les fichiers `agent.log`, `analyzer.log`, `*browser*.log` et `*.dmp` depuis le filesystem de l'hôte (répertoires de stockage CAPE).
+
+**Avec WinRM** : collecte active des Event Logs Windows.
+```bash
+sudo python3 cape_doctor.py \
+  --guest-creds winrm \
+  --guest-host 192.168.122.100 \
+  --guest-user Administrator \
+  --guest-password 'password'
+```
+Nécessite : `pip install pywinrm` + WinRM activé dans le guest (`winrm quickconfig`).
+
+### Q9 : Le rapport montre "AppArmor/SELinux blocking QEMU", que faire ?
+
+AppArmor (Ubuntu/Debian) ou SELinux (RHEL/Fedora) peut bloquer les opérations mémoire de QEMU, ce qui crash la VM sous charge (lancement navigateur = pic mémoire).
+
+```bash
+# AppArmor : passer le profil en mode permissif
+sudo aa-complain /etc/apparmor.d/usr.sbin.libvirtd
+sudo aa-complain /etc/apparmor.d/abstractions/libvirt-qemu
+
+# SELinux : passer en permissif temporairement
+sudo setenforce 0
+
+# Puis relancer l'analyse pour confirmer
+# Si ça marche, ajuster la politique (pas rester en permissif en prod)
+```
+
+### Q10 : Comment interpréter la section "VM Configuration" du rapport ?
+
+| Champ | Valeur attendue | Problème si |
+|---|---|---|
+| `ram_mib` | >= 4096 | < 4096 : RAM insuffisante |
+| `video_adapter` | `qxl` | `vga`, `virtio`, `bochs` : crash navigateur |
+| `video_vram_kib` | >= 131072 (128 MiB) | < 131072 : échec rendu |
+| `3d_acceleration` | absent ou `off` | `on` : crash GPU process |
+| `graphics_controller` | `vboxvga` | `vmsvga`, `vboxsvga` : instable |
+| `hyperv_enlightenments` | `relaxed,spinlocks,vapic` | `none` : freeze sous charge |
+| `host_ram_available_mib` | >= 2048 | < 2048 : OOM imminent |
+| `browser_crash_failures` | `0` | > 0 : crashs confirmés |
+| `qemu_running` | `yes` (si VM active) | absent : VM non démarrée |
+| `mitm_enabled` | `no` | `yes` : peut casser TLS/certs |
+
+---
+
 ## Dépannage du script lui-même
 
 | Problème | Cause | Solution |
