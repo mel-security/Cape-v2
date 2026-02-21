@@ -78,15 +78,10 @@ Ajoute des tests DNS (`getent hosts example.com`), ping (`1.1.1.1`) et HTTPS (`c
 ### Collecte + remédiations automatiques
 
 ```bash
-sudo python3 cape_doctor.py --fix
+sudo python3 cape_doctor.py --fix --vm-name win10-cape
 ```
 
-En plus de la collecte, applique les correctifs safe :
-- Active `net.ipv4.ip_forward`
-- Ajoute la règle `MASQUERADE` si absente
-- Corrige les permissions des répertoires de logs CAPE/Cuckoo
-- Relance les services CAPE/Cuckoo et libvirtd
-- Désactive l'accélération 3D VirtualBox (si hypervisor=virtualbox et `--vm-name` fourni)
+En plus de la collecte, applique les correctifs safe (détail complet dans la section Remédiations).
 
 ### Collecte avec VM spécifique (VirtualBox)
 
@@ -165,11 +160,56 @@ Paramètres clés extraits : machinery, interface réseau, route, resultserver i
 - `VBoxManage list vms`, `showvminfo`
 - Logs VM (`VBox*.log`)
 
+#### Inspection VM approfondie (si `--vm-name` fourni)
+
+**KVM** :
+- Dump XML complet (`virsh dumpxml`)
+- RAM allouée (seuil minimum : 4096 MiB pour navigateurs modernes)
+- Type d'adaptateur vidéo (VGA, virtio, QXL, bochs) et VRAM
+- Accélération 3D (accel3d)
+- Modèle CPU et mode passthrough
+- Hyper-V enlightenments (relaxed, vapic, spinlocks)
+- Liste des snapshots
+- Ligne de commande du processus QEMU en cours d'exécution
+- Blocages AppArmor/SELinux sur le processus QEMU
+
+**VirtualBox** :
+- Configuration machine lisible (`--machinereadable`)
+- RAM allouée
+- Contrôleur graphique (VBoxVGA, VBoxSVGA, VMSVGA)
+- VRAM
+- Accélération 3D et 2D
+- Hardware virtualization (hwvirtex, nested paging)
+
+#### Pression mémoire hôte
+
+- RAM disponible vs seuil critique (2048 MiB minimum libre)
+- Transparent Huge Pages (THP)
+- KSM (Kernel Same-page Merging)
+
+#### Configuration navigateur CAPE
+
+- Packages CAPE browser/chrome/edge : présence des flags `--disable-gpu`, `--no-sandbox`
+- MITM / sniffer activé dans `auxiliary.conf`
+- Détection de conflit entre sandbox navigateur et instrumentation CAPE
+
+#### Synchronisation horloge
+
+- Status NTP hôte (`timedatectl`)
+- Drift horloge matérielle vs système
+- Impact sur validation TLS dans le guest
+
 #### Ressources et runtime
 
 - RAM libre, swap, disque (`df -h`)
 - Erreurs I/O, OOM killer (dmesg, journald)
 - Logs CAPE/Cuckoo (`/var/log/cape/*`, `/var/log/cuckoo/*`, `~/.cuckoo/log/*`)
+
+#### Analyses CAPE récentes échouées
+
+- Scan des 20 dernières analyses dans le storage
+- Détection de signatures de crash navigateur (chrome.exe, msedge.exe, GPU process crash, WerFault, STATUS_ACCESS_VIOLATION)
+- Copie des logs des analyses échouées dans le bundle
 
 ### B. Checks guest (VM Windows)
 
@@ -185,28 +225,77 @@ Paramètres clés extraits : machinery, interface réseau, route, resultserver i
 
 ### C. Corrélation et diagnostics
 
-Le script analyse l'ensemble du corpus collecté et détecte automatiquement :
+Le script analyse l'ensemble du corpus collecté (commandes + logs) et détecte automatiquement :
 
 | Symptôme | Causes probables détectées |
 |---|---|
-| VM crash avec navigateur moderne | OOM kill du process qemu/VirtualBox, accélération 3D VirtualBox instable, manque de RAM guest/hôte |
-| IE marque toutes les URLs malveillantes | Erreurs TLS/cert (MITM), DNS sinkhole, proxy renvoyant block page, SmartScreen/Defender actif, scoring CAPE trop agressif |
-| Agent/resultserver non joignable | Mismatch IP resultserver (après changement IP hôte), FORWARD DROP sans MASQUERADE, firewall |
-| VM non démarrable | Flags VT-x/AMD-V absents, erreurs hyperviseur, EPT/invalid opcode |
+| VM crash avec navigateur moderne | OOM kill du process qemu/VirtualBox, accélération 3D instable, RAM VM insuffisante (<4 GB), adaptateur vidéo incompatible (VGA/virtio au lieu de QXL), Hyper-V enlightenments manquants, conflit sandbox navigateur vs CAPE monitor, VC++ runtimes manquants |
+| Crash GPU process Chrome/Edge | `STATUS_ACCESS_VIOLATION`, `GpuProcessHost::OnProcessCrashed`, flags `--disable-gpu`/`--no-sandbox` absents du package CAPE, VRAM trop basse |
+| KVM internal error | Triple fault, `KVM_EXIT_INTERNAL_ERROR`, CPU non host-passthrough, EPT manquant |
+| CAPE monitor injection failure | `inject_dll failed`, `capemon error`, conflit avec architecture multi-process des navigateurs modernes |
+| Snapshot corrompu | `snapshot error`, `restore failed`, snapshot pris pendant activité GPU/navigateur |
+| IE marque toutes les URLs malveillantes | Erreurs TLS/cert (MITM), DNS sinkhole, proxy renvoyant block page, SmartScreen/Defender actif |
+| Agent CAPE non joignable | Timeout agent, `connection refused` sur port 8000/2042, agent.pyw non démarré |
+| IP forwarding désactivé | `net.ipv4.ip_forward = 0`, pas de MASQUERADE |
+| Resultserver non joignable | IP/port mismatch, FORWARD DROP, firewall |
+| AppArmor/SELinux bloque QEMU | Entrées `denied` dans audit log pour processus qemu |
+| Pression mémoire hôte | RAM disponible < 2 GB, OOM killer actif |
+| NTP non synchronisé | Drift horloge -> échec validation certificats TLS dans le guest |
+| Erreurs display QEMU | Erreurs QXL/spice/virtio-gpu/cirrus dans logs libvirt |
 
 ### D. Remédiations (`--fix`)
 
-Toutes les actions sont loggées. Seuls les correctifs safe sont appliqués :
+Toutes les actions sont loggées. Seuls les correctifs safe sont appliqués.
+
+#### Fixes réseau
 
 | Action | Condition |
 |---|---|
 | `sysctl -w net.ipv4.ip_forward=1` | Toujours |
 | Ajout règle `MASQUERADE` sur interface par défaut | Si absente |
-| `chmod -R u+rwX` sur répertoires de logs | Si existent |
-| `systemctl restart` des services CAPE/libvirt | Si systemd détecté |
-| `VBoxManage modifyvm --accelerate3d off` | Si hypervisor=virtualbox et `--vm-name` fourni |
 
-Les correctifs guest (certificats, SmartScreen, proxy) sont signalés dans le rapport mais **jamais appliqués automatiquement** sans credentials.
+#### Fixes permissions et services
+
+| Action | Condition |
+|---|---|
+| `chmod -R u+rwX` sur répertoires de logs | Si existent |
+| Activation KSM | Si `/sys/kernel/mm/ksm/run = 0` |
+| `systemctl restart` des services CAPE/libvirt | Si systemd détecté (en dernier) |
+
+#### Fixes KVM (si `--vm-name` fourni)
+
+| Action | Condition |
+|---|---|
+| Changement adaptateur vidéo -> QXL | Si actuellement VGA, virtio, bochs, ou ramfb |
+| Augmentation VRAM | Si < 128 MiB |
+| Désactivation accélération 3D | Si `accel3d='yes'` |
+| Ajout Hyper-V enlightenments | Si `relaxed`, `vapic`, ou `spinlocks` manquants |
+| CPU mode `host-passthrough` | Si non configuré |
+| Augmentation RAM VM -> 4096 MiB | Si < 4096 MiB |
+| `virsh define` du XML corrigé | Si au moins un changement appliqué |
+
+**Important** : après modification du XML KVM, l'ancien snapshot est invalide. Le script signale qu'il faut recréer le snapshot.
+
+#### Fixes VirtualBox (si `--vm-name` fourni)
+
+| Action | Condition |
+|---|---|
+| `--accelerate3d off` | Si 3D activée |
+| `--graphicscontroller vboxvga` | Si VMSVGA ou VBoxSVGA |
+| `--vram 128` | Si VRAM < 128 MiB |
+| `--memory 4096` | Si RAM < 4096 MiB |
+| `--hwvirtex on --nestedpaging on` | Si hwvirtex désactivé |
+
+**Important** : après modification VirtualBox, l'ancien snapshot est invalide. Recréer le snapshot.
+
+#### Fixes NON appliqués (signalés dans le rapport)
+
+Les actions suivantes sont recommandées mais jamais exécutées automatiquement :
+- Installation de VC++ Redistributables dans le guest
+- Modification des flags de lancement du navigateur dans le guest
+- Configuration SmartScreen/Defender dans le guest
+- Certificats racine / proxy dans le guest
+- Suppression/recréation de snapshot
 
 ---
 
@@ -231,6 +320,11 @@ Rapport Markdown structuré :
 ## Inventory
 - hostname, kernel, os_release, virt_flags_count
 
+## VM Configuration
+- ram_mib, video_adapter, video_vram_kib, 3d_acceleration
+- hyperv_enlightenments, host_ram_available_mib
+- qemu_running, browser_crash_failures, ...
+
 ## Key Checks
 - [PASS|WARN] <commande> (rc=<N>) -> <fichier_json>
 
@@ -250,15 +344,20 @@ Rapport Markdown structuré :
 cape_triage_<timestamp>/
 ├── cape_doctor.log          # Log du script
 ├── report.md                # Rapport final
+├── fixed_vm.xml             # XML KVM corrigé (si --fix appliqué)
 ├── commands/                # Sorties JSON de chaque commande exécutée
 │   ├── os_release.json
 │   ├── uname.json
+│   ├── virsh_dumpxml.json
+│   ├── vbox_machinereadable.json
+│   ├── qemu_process.json
 │   ├── svc_cape.json
 │   ├── iptables_nat.json
 │   └── ...
 ├── configs/                 # Copies masquées des fichiers de config
 │   ├── CAPEv2_conf_cuckoo.conf
 │   ├── CAPEv2_conf_routing.conf
+│   ├── package_chrome.py    # Packages navigateur CAPE
 │   └── ...
 ├── logs/                    # Tails des logs collectés
 │   ├── _var_log_cape_cuckoo.log.tail.log
@@ -267,6 +366,11 @@ cape_triage_<timestamp>/
 ├── metadata/                # Données structurées
 │   ├── environment.json
 │   └── parsed_configs.json
+├── failed_analyses/         # Analyses CAPE récentes échouées
+│   ├── 42/
+│   │   ├── task.json
+│   │   └── analysis.log
+│   └── ...
 └── guest/                   # Artefacts guest (si disponibles)
     ├── agent.log
     ├── analyzer.log
@@ -277,27 +381,48 @@ cape_triage_<timestamp>/
 
 ## Interprétation rapide du rapport
 
-### Findings HIGH
+### Findings HIGH - Crash navigateur
 
-Action immédiate requise. Bloquants probables.
+Action immédiate requise. Causes directes du crash.
 
-- **"VM process likely killed by OOM"** : Le processus qemu/VirtualBox a été tué par le kernel. Augmenter la RAM hôte, réduire la RAM VM, ajouter du swap, ou réduire le nombre d'analyses concurrentes.
-- **"Potential routing/NAT breakage"** : La policy FORWARD est DROP sans règle MASQUERADE. Le guest n'a pas d'accès réseau sortant. Relancer avec `--fix` ou ajouter manuellement la règle NAT.
-- **"Resultserver communication issue"** : Le resultserver n'est pas joignable depuis le guest. Vérifier que l'IP dans `routing.conf`/`machinery.conf` correspond à l'IP actuelle de l'hôte sur l'interface du réseau guest.
-- **"Virtualization flags missing"** : VT-x ou AMD-V désactivé dans le BIOS/UEFI. Activer et redémarrer l'hôte.
+- **"VM RAM too low for modern browsers (N MiB < 4096 MiB)"** : Chrome/Edge consomment 2-3 GB seuls. La VM a besoin d'au minimum 4 GB RAM. `--fix` augmente automatiquement.
+- **"KVM video adapter 'vga' incompatible with modern browsers"** : L'adaptateur VGA/virtio/bochs ne supporte pas le rendu Chrome/Edge. Passer à QXL. `--fix` corrige automatiquement.
+- **"KVM 3D acceleration enabled"** / **"VirtualBox 3D acceleration enabled"** : L'accélération 3D est expérimentale et fait crasher le GPU process du navigateur. `--fix` désactive automatiquement.
+- **"VirtualBox graphics controller 'VMSVGA' unstable"** : VMSVGA/VBoxSVGA avec 3D = crash garanti. Passer à VBoxVGA. `--fix` corrige automatiquement.
+- **"Browser crash detected in N/M recent failed analyses"** : Signatures de crash navigateur confirmées dans les analyses CAPE récentes. Suivre les recommandations détaillées dans le finding.
+- **"CAPE browser package missing --disable-gpu / --no-sandbox"** : Le package navigateur CAPE ne passe pas les flags nécessaires. Chrome/Edge essaient d'utiliser le GPU (qui n'existe pas dans la VM) et crashent.
+- **"CAPE monitor injection failure"** : L'injection DLL de CAPE dans le processus navigateur échoue. Tester avec `options=free=yes`.
+- **"AppArmor/SELinux blocking QEMU"** : Le MAC bloque les opérations mémoire de QEMU, ce qui crash la VM au lancement du navigateur.
+
+### Findings HIGH - Infrastructure
+
+- **"VM process likely killed by OOM"** : Le kernel a tué le processus qemu/VirtualBox. Augmenter la RAM hôte, ajouter du swap, réduire les analyses concurrentes.
+- **"Host RAM critically low"** : Moins de 2 GB libres sur l'hôte. OOM imminent.
+- **"IP forwarding disabled"** : Le guest n'a aucun accès réseau. `--fix` active `ip_forward`.
+- **"Potential routing/NAT breakage"** : FORWARD DROP sans MASQUERADE. `--fix` ajoute la règle.
+- **"Resultserver communication issue"** : Vérifier IP/port dans `routing.conf`/`machinery.conf`.
+- **"KVM internal error / triple fault"** : Utiliser CPU host-passthrough. `--fix` l'applique.
+- **"VM snapshot restore failure"** : Recréer le snapshot depuis un état VM propre (desktop, pas d'applications ouvertes).
+- **"CAPE agent not responding"** : Vérifier agent.pyw dans Startup du guest + firewall Windows.
+- **"Virtualization flags missing"** : Activer VT-x/AMD-V dans le BIOS/UEFI.
 
 ### Findings MEDIUM
 
 Facteurs aggravants ou causes secondaires.
 
-- **"Potential browser crash from VirtualBox 3D/GPU acceleration"** : L'accélération 3D cause des crashs avec les navigateurs modernes dans VirtualBox. Désactiver via `--fix` ou manuellement avec `VBoxManage modifyvm <vm> --accelerate3d off`.
-- **"IE marking all URLs may be policy/TLS/proxy artifact"** : Vérifier dans le guest : certificats racine (MITM proxy), paramètres SmartScreen/Defender, config proxy, zones de sécurité IE. Un DNS sinkhole ou proxy transparent peut renvoyer des block pages interprétées comme contenu malveillant par les signatures CAPE.
-- **"Hypervisor not auto-detected"** : Installer les outils CLI (`virsh` ou `VBoxManage`) ou forcer avec `--hypervisor kvm|virtualbox`.
-- **"WinRM collection requested but missing credentials"** : Fournir `--guest-host`, `--guest-user`, `--guest-password`.
+- **"Missing Hyper-V enlightenments"** : Windows guest sans `relaxed`/`vapic`/`spinlocks` = instabilité sous charge. `--fix` les ajoute.
+- **"QEMU not using '-cpu host' passthrough"** : Instructions CPU manquantes peuvent faire crasher le JIT/WASM du navigateur.
+- **"VM VRAM low"** : VRAM < 128 MiB cause des échecs de rendu. `--fix` augmente.
+- **"VirtualBox VRAM too low"** : Idem pour VirtualBox. `--fix` corrige.
+- **"Host NTP not synchronized"** : Drift horloge -> échec TLS dans le guest -> toutes les URLs échouent.
+- **"QEMU display device errors"** : Erreurs QXL/spice/virtio-gpu. Changer d'adaptateur vidéo.
+- **"IE marking all URLs may be policy/TLS/proxy artifact"** : Vérifier certificats racine, SmartScreen, proxy, DNS sinkhole dans le guest.
+- **"Hypervisor not auto-detected"** : Forcer `--hypervisor kvm|virtualbox`.
 
 ### Findings LOW
 
-- **"No obvious hard failure signatures"** : Aucune erreur bloquante détectée automatiquement. Le problème peut être intermittent ou spécifique au guest. Relancer une analyse unitaire avec le logging CAPE verbeux activé et collecter les Event Logs guest manuellement.
+- **"KSM disabled"** : Activer KSM peut économiser 10-30% RAM avec plusieurs VMs similaires.
+- **"No obvious hard failure signatures"** : Relancer une analyse unitaire avec logging verbeux.
 
 ---
 
@@ -345,11 +470,23 @@ cape_doctor.py
 │   ├── parse_configs()          # Parse configs CAPE/Cuckoo, extraction params clés
 │   ├── collect_network()        # ip, routes, iptables, NAT, forwarding, DNS
 │   ├── collect_hypervisor()     # KVM (virsh) ou VirtualBox (VBoxManage) + logs
+│   │
+│   ├── collect_vm_config()      # Inspection VM approfondie
+│   │   ├── _inspect_kvm_vm()    #   KVM: XML, RAM, vidéo, CPU, Hyper-V, AppArmor
+│   │   └── _inspect_vbox_vm()   #   VBox: config, RAM, GFX, VRAM, 3D, hwvirtex
+│   ├── check_host_memory()      # Pression mémoire hôte, THP, KSM
+│   ├── check_cape_browser_config()  # Packages browser, flags --disable-gpu
+│   ├── check_clock_drift()      # NTP, drift horloge, impact TLS
+│   │
 │   ├── collect_resources_and_runtime_logs()  # RAM, disk, OOM, logs runtime
+│   ├── collect_failed_analyses()    # Scan analyses CAPE échouées, crash navigateur
 │   ├── collect_guest()          # Collecte passive + WinRM optionnel
 │   │   └── _collect_winrm()     # Event Logs Windows via pywinrm
-│   ├── correlate()              # Corrélation symptoms -> causes -> actions
+│   │
+│   ├── correlate()              # Corrélation symptoms -> causes -> actions (étendue)
 │   ├── apply_fixes()            # Remédiations safe (si --fix)
+│   │   ├── _fix_kvm_browser_crash()   #   KVM: vidéo, 3D, Hyper-V, CPU, RAM, XML
+│   │   └── _fix_vbox_browser_crash()  #   VBox: 3D, GFX, VRAM, RAM, hwvirtex
 │   ├── write_report()           # Génération report.md
 │   ├── create_archive()         # Création tar.gz
 │   └── print_summary()         # Résumé coloré terminal
@@ -370,14 +507,118 @@ main()
  ├─ parse_configs()
  ├─ collect_network()
  ├─ collect_hypervisor()
+ ├─ collect_vm_config()              # NEW: inspection VM profonde
+ ├─ check_host_memory()              # NEW: pression mémoire hôte
+ ├─ check_cape_browser_config()      # NEW: config navigateur CAPE
+ ├─ check_clock_drift()              # NEW: synchronisation horloge
  ├─ collect_resources_and_runtime_logs()
+ ├─ collect_failed_analyses()        # NEW: analyses CAPE échouées
  ├─ collect_guest()
- ├─ correlate()
- ├─ apply_fixes()          # seulement si --fix
- ├─ write_report()         # -> report.md
- ├─ create_archive()       # -> .tar.gz
- └─ print_summary()        # -> stdout
+ ├─ correlate()                      # ENHANCED: patterns navigateur
+ ├─ apply_fixes()                    # ENHANCED: fixes KVM/VBox browser
+ ├─ write_report()
+ ├─ create_archive()
+ └─ print_summary()
 ```
+
+---
+
+## Guide de résolution : crash navigateur moderne dans la VM
+
+Si la VM crash systématiquement après le lancement de Chrome/Edge, suivre cet ordre :
+
+### 1. Diagnostic rapide
+
+```bash
+sudo python3 cape_doctor.py --vm-name <nom-vm> --verbose
+```
+
+Examiner le rapport, section "Findings HIGH". Les causes les plus fréquentes sont listées ci-dessous par ordre de probabilité.
+
+### 2. Causes les plus fréquentes (par ordre)
+
+**a) Accélération 3D activée** (cause n°1)
+```bash
+# KVM - vérifier
+virsh dumpxml <vm> | grep accel3d
+# VirtualBox - vérifier
+VBoxManage showvminfo <vm> | grep -i "3d"
+# Fix automatique
+sudo python3 cape_doctor.py --fix --vm-name <vm>
+```
+
+**b) Adaptateur vidéo incompatible** (KVM)
+```bash
+# Vérifier - si c'est "vga", "virtio", "bochs" -> problème
+virsh dumpxml <vm> | grep -A2 "<video>"
+# Fix: passer à QXL
+sudo python3 cape_doctor.py --fix --vm-name <vm>
+# Puis installer le driver QXL WDDM dans le guest (virtio-win ISO)
+```
+
+**c) Contrôleur graphique instable** (VirtualBox)
+```bash
+# Vérifier - si VMSVGA ou VBoxSVGA -> problème
+VBoxManage showvminfo <vm> --machinereadable | grep -i graphic
+# Fix: passer à VBoxVGA
+sudo python3 cape_doctor.py --fix --vm-name <vm>
+```
+
+**d) RAM VM insuffisante** (<4 GB)
+```bash
+# Fix automatique
+sudo python3 cape_doctor.py --fix --vm-name <vm>
+```
+
+**e) Flags navigateur manquants dans le package CAPE**
+
+Modifier le package browser dans CAPE pour ajouter aux arguments de lancement :
+```
+--disable-gpu --disable-software-rasterizer --no-sandbox --disable-dev-shm-usage
+```
+
+Ou soumettre l'analyse avec :
+```
+options=browser_args=--disable-gpu,--no-sandbox
+```
+
+**f) Conflit CAPE monitor / sandbox navigateur**
+
+Tester avec :
+```
+options=free=yes
+```
+Si le navigateur ne crashe plus, c'est l'injection DLL qui pose problème. Solutions :
+- Mettre à jour CAPE vers la dernière version
+- Utiliser `options=injection=0` si l'analyse comportementale n'est pas nécessaire
+
+### 3. Après les correctifs
+
+```bash
+# Recréer le snapshot (OBLIGATOIRE après modification VM)
+# KVM:
+virsh start <vm>
+# attendre boot complet...
+virsh snapshot-create-as <vm> clean --atomic
+
+# VirtualBox:
+VBoxManage startvm <vm> --type headless
+# attendre boot complet...
+VBoxManage snapshot <vm> take clean --live
+
+# Relancer une analyse test
+```
+
+### 4. Si le problème persiste
+
+```bash
+# Collecte complète avec tests réseau
+sudo python3 cape_doctor.py --fix --online --vm-name <vm> --verbose \
+  --guest-creds winrm --guest-host <ip-guest> \
+  --guest-user Administrator --guest-password '<pwd>'
+```
+
+Examiner `failed_analyses/` dans l'archive pour les logs de crash détaillés.
 
 ---
 
