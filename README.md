@@ -393,6 +393,91 @@ main()
 
 ---
 
+## deploy_minimal.py
+
+Script all-in-one pour déployer une VM "windows-minimal" sur QEMU/KVM + libvirt, destinée à CAPEv2, à partir d'une installation existante.
+
+### Principe
+
+Le script clone la VM existante (`window`) en une nouvelle VM `windows-minimal` avec un profil libvirt nettoyé (sans watchdog, sans redirdev USB, sans tablet input), crée deux overlays qcow2 (base + chrome), et met à jour `kvm.conf` pour que CAPE utilise la nouvelle VM.
+
+**Zéro impact** : la VM source, ses snapshots, et le réseau libvirt ne sont jamais modifiés.
+
+### Prérequis
+
+- **Root / sudo** requis
+- QEMU/KVM + libvirt installés et fonctionnels
+- Au moins une VM Windows existante définie dans libvirt (par défaut `window`)
+- Espace disque suffisant dans `/var/lib/libvirt/images/` (taille de la VM source x1.5 environ)
+
+### Usage
+
+```bash
+# Déploiement normal
+sudo python3 deploy_minimal.py
+
+# Prévisualisation (aucune modification)
+sudo python3 deploy_minimal.py --dry-run
+
+# Si "windows-minimal" existe déjà, suffixer automatiquement
+sudo python3 deploy_minimal.py --force
+
+# Déployer la VM sans modifier kvm.conf
+sudo python3 deploy_minimal.py --no-kvmconf
+```
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--dry-run` | Affiche toutes les opérations sans rien exécuter |
+| `--force` | Si le domaine `windows-minimal` existe, utilise un suffixe horodaté |
+| `--no-kvmconf` | Ne pas modifier `/opt/CAPEv2/conf/kvm.conf` |
+
+### Ce que fait le script
+
+1. **Détection** : identifie la VM source (préfère `window`) et son disque principal
+2. **Base image** : `qemu-img convert` du disque source -> `windows-minimal.base.qcow2` (clone complet, pas de backing chain)
+3. **Chrome overlay** : `qemu-img create` overlay `windows-minimal.chrome.qcow2` <- `windows-minimal.base.qcow2`
+4. **Domaine libvirt** : génère un XML nettoyé (sans watchdog, redirdev, tablet USB) et `virsh define`
+5. **Snapshot libvirt** : crée un snapshot `windows-minimal_chrome` pour le revert CAPE
+6. **kvm.conf** : remplace `window` -> `windows-minimal`, `snapshot11` -> `windows-minimal_chrome`
+7. **Vérification** : contrôle l'intégrité de la VM source, la propreté du XML, la profondeur de chain
+
+### Modifications kvm.conf
+
+Le script modifie le fichier en place avec backup atomique :
+
+- `machines = window` -> `machines = windows-minimal`
+- `[window]` -> `[windows-minimal]`
+- `label = window` -> `label = windows-minimal`
+- `snapshot = snapshot11` -> `snapshot = windows-minimal_chrome`
+- Backup : `/opt/CAPEv2/conf/kvm.conf.bak.<timestamp>`
+
+Les autres valeurs (platform, arch, interface, ip, tags) sont préservées telles quelles.
+
+### Rollback
+
+Pour revenir à l'état initial :
+
+```bash
+# 1. Restaurer kvm.conf
+sudo cp /opt/CAPEv2/conf/kvm.conf.bak.<TIMESTAMP> /opt/CAPEv2/conf/kvm.conf
+
+# 2. Supprimer le domaine
+sudo virsh undefine windows-minimal
+
+# 3. (Optionnel) Supprimer les images créées
+sudo rm -f /var/lib/libvirt/images/windows-minimal.base.qcow2
+sudo rm -f /var/lib/libvirt/images/windows-minimal.chrome.qcow2
+```
+
+### Log
+
+Le script produit un rapport complet dans `/tmp/windows-minimal-deploy.<timestamp>.log` et sur stdout.
+
+---
+
 ## Licence
 
 Voir le dépôt pour les conditions de licence.
