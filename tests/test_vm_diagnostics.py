@@ -345,7 +345,7 @@ class TestParseVmXml:
 
 class TestFixVmXml:
     def test_removes_redirdev_and_watchdog(self, tmp_path):
-        doctor = _make_doctor(tmp_path, ["--fix", "--fix-vm-xml"])
+        doctor = _make_doctor(tmp_path, ["--fix"])
         root = ET.fromstring(SPICE_VM_XML)
         devices = root.find("devices")
 
@@ -371,7 +371,7 @@ class TestFixVmXml:
         assert len(tablets) == 0
 
     def test_spice_to_vnc_when_flag_set(self, tmp_path):
-        doctor = _make_doctor(tmp_path, ["--fix", "--fix-vm-xml", "--fix-spice-to-vnc"])
+        doctor = _make_doctor(tmp_path, ["--fix", "--fix-spice-to-vnc"])
         root = ET.fromstring(SPICE_VM_XML)
         devices = root.find("devices")
 
@@ -399,7 +399,7 @@ class TestFixVmXml:
         assert len([a for a in devices.findall("audio") if a.get("type") == "spice"]) == 0
 
     def test_no_changes_on_minimal_vm(self, tmp_path):
-        doctor = _make_doctor(tmp_path, ["--fix", "--fix-vm-xml"])
+        doctor = _make_doctor(tmp_path, ["--fix"])
         root = ET.fromstring(MINIMAL_VM_XML)
         result = doctor._fix_vm_xml("win10", MINIMAL_VM_XML, root)
         assert result is False

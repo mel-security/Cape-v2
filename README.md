@@ -46,82 +46,73 @@ cape_doctor.py [OPTIONS]
 | Option | Défaut | Description |
 |---|---|---|
 | `--out-dir <path>` | `./cape_triage_<timestamp>` | Répertoire de sortie pour les artefacts |
-| `--vm-name <name>` | *(auto-détection)* | Nom de la VM guest (si non détectable) |
+| `--vm-name <name>` | *(toutes les VMs)* | Restreindre le diagnostic à une VM spécifique |
 | `--hypervisor auto\|kvm\|virtualbox` | `auto` | Forcer le type d'hyperviseur |
-| `--fix` | désactivé | Appliquer les remédiations safe (non destructif) |
+| `--fix` | désactivé | Appliquer les remédiations safe — **inclut la correction du XML VM** |
+| `--fix-spice-to-vnc` | désactivé | En plus de `--fix` : convertir SPICE→VNC et QXL→VGA |
 | `--online` | désactivé | Autoriser les tests réseau externes (ping, DNS, HTTPS) |
 | `--guest-creds none\|winrm\|ssh\|manual` | `none` | Méthode de collecte guest |
 | `--guest-host <ip>` | — | IP/hostname du guest pour WinRM/SSH |
 | `--guest-user <user>` | — | Utilisateur guest |
 | `--guest-password <pwd>` | — | Mot de passe guest (préférer env/secret store) |
-| `--verbose` | désactivé | Logging détaillé (DEBUG) |
-| `--all-vms` | désactivé | Diagnostiquer toutes les VMs (pas uniquement `--vm-name`) |
-| `--fix-vm-xml` | désactivé | Supprimer les devices risqués du XML VM (requiert `--fix`) |
-| `--fix-spice-to-vnc` | désactivé | Convertir SPICE en VNC et QXL en VGA (requiert `--fix --fix-vm-xml`) |
 | `--backing-chain-threshold <N>` | `5` | Seuil d'alerte pour la profondeur de backing chain qcow2 |
+| `--verbose` | désactivé | Logging détaillé (DEBUG) |
 
 ---
 
 ## Exemples d'utilisation
 
-### Collecte simple (mode par défaut)
+### Diagnostic complet (commande de base recommandée)
 
 ```bash
 sudo python3 cape_doctor.py
 ```
 
-Exécute tous les checks hôte, collecte les logs, corrèle les symptômes, génère le rapport et l'archive. Aucune modification apportée au système.
+Détecte automatiquement l'hyperviseur, diagnostique **toutes les VMs**, analyse les logs libvirt/QEMU, linte les configs XML, vérifie la backing chain, corrèle les symptômes et génère le rapport. **Aucune modification** apportée au système.
 
-### Collecte avec tests réseau en ligne
-
-```bash
-sudo python3 cape_doctor.py --online
-```
-
-Ajoute des tests DNS (`getent hosts example.com`), ping (`1.1.1.1`) et HTTPS (`curl https://example.com`) pour valider la connectivité sortante.
-
-### Collecte + remédiations automatiques
+### Diagnostic + corrections automatiques
 
 ```bash
 sudo python3 cape_doctor.py --fix
 ```
 
-En plus de la collecte, applique les correctifs safe :
-- Active `net.ipv4.ip_forward`
-- Ajoute la règle `MASQUERADE` si absente
-- Corrige les permissions des répertoires de logs CAPE/Cuckoo
+Même chose, plus toutes les corrections safe en une seule commande :
+- Active `net.ipv4.ip_forward` et règle MASQUERADE si absents
+- **Supprime les devices instables de toutes les VMs** (USB redirection, watchdog) avec backup XML
+- Corrige les permissions des logs CAPE/Cuckoo
 - Relance les services CAPE/Cuckoo et libvirtd
-- Désactive l'accélération 3D VirtualBox (si hypervisor=virtualbox et `--vm-name` fourni)
 
-### Diagnostic VM complet avec fix XML
-
-```bash
-sudo python3 cape_doctor.py --fix --fix-vm-xml --vm-name win10-cape
-```
-
-Diagnostique la VM `win10-cape`, supprime les devices risqués (USB redirection, watchdog) et génère un rapport avec inventaire VM.
-
-### Fix complet : SPICE vers VNC + suppression devices inutiles
+### Corrections + passage en mode headless (SPICE→VNC)
 
 ```bash
-sudo python3 cape_doctor.py --fix --fix-vm-xml --fix-spice-to-vnc --vm-name win10-cape
+sudo python3 cape_doctor.py --fix --fix-spice-to-vnc
 ```
 
-En plus des suppressions de base, convertit SPICE en VNC et QXL en VGA pour un profil sandbox headless minimal.
+Idem `--fix`, et convertit aussi SPICE en VNC et QXL en VGA : profil sandbox headless minimal.
 
-### Diagnostic de toutes les VMs
+### Restreindre à une VM spécifique
 
 ```bash
-sudo python3 cape_doctor.py --all-vms --backing-chain-threshold 3
+sudo python3 cape_doctor.py --vm-name win10-cape
 ```
 
-Diagnostique toutes les VMs libvirt, avec un seuil d'alerte de backing chain à 3 niveaux.
+Par défaut toutes les VMs sont diagnostiquées. `--vm-name` sert uniquement à restreindre la portée.
 
-### Collecte avec VM spécifique (VirtualBox)
+### Ajuster le seuil de backing chain
 
 ```bash
-sudo python3 cape_doctor.py --hypervisor virtualbox --vm-name win10-analysis
+sudo python3 cape_doctor.py --backing-chain-threshold 3
 ```
+
+Alerte si la chaîne qcow2 dépasse 3 niveaux (défaut : 5).
+
+### Avec tests réseau en ligne
+
+```bash
+sudo python3 cape_doctor.py --online
+```
+
+Ajoute des tests DNS (`getent hosts example.com`), ping (`1.1.1.1`) et HTTPS pour valider la connectivité sortante.
 
 ### Collecte avec WinRM (guest Windows)
 
@@ -133,14 +124,12 @@ sudo python3 cape_doctor.py \
   --guest-password 'S3cret!'
 ```
 
-Récupère les Event Logs Windows (System, 200 dernières entrées) via WinRM. Nécessite `pywinrm` installé sur l'hôte et le service WinRM actif sur le guest.
+Récupère les Event Logs Windows (System, 200 dernières entrées) via WinRM. Nécessite `pywinrm` installé et WinRM actif sur le guest.
 
-### Collecte complète (online + fix + VM + verbose)
+### Tout en un (diagnostic + corrections + réseau + verbose)
 
 ```bash
-sudo python3 cape_doctor.py \
-  --online --fix --fix-vm-xml --fix-spice-to-vnc --verbose \
-  --hypervisor kvm --vm-name win10-cape
+sudo python3 cape_doctor.py --fix --fix-spice-to-vnc --online --verbose
 ```
 
 ---
@@ -291,7 +280,7 @@ Toutes les actions sont loggées. Seuls les correctifs safe sont appliqués :
 | `systemctl restart` des services CAPE/libvirt | Si systemd détecté |
 | `VBoxManage modifyvm --accelerate3d off` | Si hypervisor=virtualbox et `--vm-name` fourni |
 
-#### Remédiations VM XML (`--fix --fix-vm-xml`)
+#### Remédiations VM XML (incluses dans `--fix`)
 
 | Action | Condition |
 |---|---|
@@ -402,8 +391,8 @@ cape_triage_<timestamp>/
 Action immédiate requise. Bloquants probables.
 
 - **"STOPPED_BY_LIBVIRT"** : La VM a été tuée par libvirtd (SIGTERM signal 15), pas un crash guest. Vérifier watchdog, OOM cgroup, ou libvirtd restart. Utiliser `--fix --fix-vm-xml` pour supprimer le watchdog.
-- **"QEMU_MONITOR_LOST"** : libvirtd a perdu la connexion au monitor QEMU. Souvent causé par des devices SPICE/USB instables. Supprimer USB redirection et passer en VNC avec `--fix --fix-vm-xml --fix-spice-to-vnc`.
-- **"DEVICE_LINT (HIGH)"** : La VM contient des devices à haut risque (USB redir, watchdog reset). Ces devices causent des instabilités avec les packages lourds (Chrome). Appliquer `--fix --fix-vm-xml`.
+- **"QEMU_MONITOR_LOST"** : libvirtd a perdu la connexion au monitor QEMU. Souvent causé par des devices SPICE/USB instables. Supprimer USB redirection et passer en VNC avec `--fix --fix-spice-to-vnc`.
+- **"DEVICE_LINT (HIGH)"** : La VM contient des devices à haut risque (USB redir, watchdog reset). Ces devices causent des instabilités avec les packages lourds (Chrome). Appliquer `--fix`.
 - **"VM process likely killed by OOM"** : Le processus qemu/VirtualBox a été tué par le kernel. Augmenter la RAM hôte, réduire la RAM VM, ajouter du swap, ou réduire le nombre d'analyses concurrentes.
 - **"Potential routing/NAT breakage"** : La policy FORWARD est DROP sans règle MASQUERADE. Le guest n'a pas d'accès réseau sortant. Relancer avec `--fix` ou ajouter manuellement la règle NAT.
 - **"Resultserver communication issue"** : Le resultserver n'est pas joignable depuis le guest. Vérifier que l'IP dans `routing.conf`/`machinery.conf` correspond à l'IP actuelle de l'hôte sur l'interface du réseau guest.
@@ -559,7 +548,7 @@ python3 -m pytest tests/test_vm_diagnostics.py -v
 | Aucun framework détecté | CAPE/Cuckoo installé dans un chemin non standard | Vérifier que `/opt/CAPEv2`, `/opt/CAPE` ou `~/.cuckoo` existe |
 | `Hypervisor not auto-detected` | `virsh`/`VBoxManage` absent du PATH | Installer les outils ou forcer `--hypervisor kvm\|virtualbox` |
 | Archive vide | Aucun artefact collecté (droits insuffisants) | Vérifier les permissions et relancer avec `sudo` |
-| VM non diagnostiquée | `--vm-name` incorrect ou absent | Utiliser `--all-vms` ou vérifier le nom avec `virsh list --all` |
+| VM non diagnostiquée | `--vm-name` incorrect | Vérifier le nom avec `virsh list --all` (sans `--vm-name` toutes les VMs sont diagnostiquées) |
 | Fix XML échoue | VM en cours d'exécution | Arrêter la VM avant le fix : `virsh shutdown <vm>` |
 
 ---

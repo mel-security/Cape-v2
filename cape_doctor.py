@@ -777,7 +777,7 @@ class CapeDoctor:
                     f"Backup: /tmp/cape_doctor_backup_{vm_name}.xml",
                     f"Fixed XML: {tmp_xml}",
                 ],
-                probable_causes=["--fix --fix-vm-xml requested by operator"],
+                probable_causes=["--fix applied by operator"],
                 recommendations=[
                     f"Verify VM starts correctly: virsh start {vm_name}",
                     f"Review with: virsh dumpxml {vm_name}",
@@ -801,16 +801,16 @@ class CapeDoctor:
             self.logger.info("No VMs found via virsh list --all")
             return
 
-        # Determine which VMs to diagnose
+        # Always diagnose all VMs so nothing is missed.
+        # --vm-name narrows the scope only when explicitly provided.
         target_vm = self.args.vm_name
-        all_vms = getattr(self.args, "all_vms", False)
-        if all_vms or not target_vm:
-            vms_to_check = vm_list
-        else:
+        if target_vm:
             vms_to_check = [v for v in vm_list if v["name"] == target_vm]
             if not vms_to_check:
-                self.logger.warning("VM '%s' not found in virsh list, checking all VMs", target_vm)
+                self.logger.warning("VM '%s' not found; falling back to all VMs", target_vm)
                 vms_to_check = vm_list
+        else:
+            vms_to_check = vm_list
 
         # Collect libvirtd journal once (shared across VMs)
         journal_result = self.run_cmd(
@@ -899,8 +899,8 @@ class CapeDoctor:
                     ]
                     recommendations = list(dict.fromkeys(i.recommendation for i in issues))
                     recommendations += [
-                        "Run with --fix --fix-vm-xml to remove risky devices automatically",
-                        "Add --fix-spice-to-vnc to also switch SPICE->VNC and QXL->VGA",
+                        "Run with --fix to remove risky devices automatically",
+                        "Also add --fix-spice-to-vnc to switch SPICE->VNC and QXL->VGA",
                     ]
                     self.findings.append(Finding(
                         severity=risk_level,
@@ -940,8 +940,8 @@ class CapeDoctor:
 
             self.vm_infos.append(vm_info)
 
-            # Apply XML fix if requested
-            if self.args.fix and getattr(self.args, "fix_vm_xml", False) and root is not None:
+            # Apply XML fix whenever --fix is used (no extra flag needed)
+            if self.args.fix and root is not None:
                 backup_path = f"/tmp/cape_doctor_backup_{vm_name}.xml"
                 try:
                     Path(backup_path).write_text(xml_str, encoding="utf-8")
@@ -1279,12 +1279,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--guest-user", help="Guest username for remote collection")
     p.add_argument("--guest-password", help="Guest password for remote collection (prefer env/secret store)")
     p.add_argument("--verbose", action="store_true")
-    p.add_argument("--all-vms", action="store_true",
-                   help="Diagnose all VMs (not just --vm-name)")
-    p.add_argument("--fix-vm-xml", action="store_true",
-                   help="Remove risky VM devices from XML (requires --fix)")
     p.add_argument("--fix-spice-to-vnc", action="store_true",
-                   help="Also switch SPICE->VNC and QXL->VGA (requires --fix --fix-vm-xml)")
+                   help="Also switch SPICE->VNC and QXL->VGA when applying VM fixes (requires --fix)")
     p.add_argument("--backing-chain-threshold", type=int, default=5,
                    help="Alert threshold for qcow2 backing chain depth (default: 5)")
     return p.parse_args(argv)
